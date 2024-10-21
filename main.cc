@@ -3,6 +3,8 @@
 
 #include <cassert>
 #include <chrono>
+#include <compare>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -17,14 +19,25 @@
 using namespace std;
 
 struct Target {
-  bool prio;
-  bool dp;
-  string u;
+  int urgency;
+  int level;
+  string msg;
 
-  Target(bool p, bool d, string_view u) : prio{p}, dp{d}, u{u} {}
+  // data used to slow down the comparisons:
+  struct Schedule {
+    chrono::steady_clock::time_point not_before;
+    chrono::steady_clock::time_point scheduled_at;
+  } schedule;
+
+  Target(int u, int lv, string_view m) : urgency{u}, level{lv}, msg{m}
+  {
+    int rnd = rand() % 100'000;
+    schedule.not_before = chrono::steady_clock::now() - chrono::seconds(rnd);
+    schedule.scheduled_at = chrono::steady_clock::now() - 2 * chrono::seconds(rnd);
+  }
   bool is_high_priority() const { return true; }
-  bool is_deep() const { return dp; }
-  std::string urgency() const { return u; }
+  bool is_deep() const { return level; }
+  std::string urgency_txt() const { return fmt::format("U({})", urgency); }
 };
 
 
@@ -36,14 +49,107 @@ struct Job {
   Target a{true, false, nm};
   Target b{false, true, nm};
 
-  const Target& earliest_target(const chrono::steady_clock::time_point& now) const
-  {
-    static int x = 0;
-    if (x++ % 2) {
-      return a;
-    }
-    return b;
+  Target& earliest_target();
+  const Target& earliest_target() const;
+  Target& earliest_target(chrono::steady_clock::time_point scrub_clock_now);
+  const Target& earliest_target(chrono::steady_clock::time_point scrub_clock_now) const;
+};
+
+static inline std::weak_ordering cmp_ripe_entries(const Target& l,
+                                                  const Target& r) noexcept
+{
+  // for 'higher is better' sub elements - the 'r.' is on the left
+  if (auto cmp = r.urgency <=> l.urgency; cmp != 0) {
+    return cmp;
   }
+  // if we are comparing the two targets of the same PG, once both are
+  // ripe - the 'deep' scrub is considered 'higher' than the 'shallow' one.
+//   if (l.pgid == r.pgid && r.level < l.level) {
+//     return std::weak_ordering::less;
+//   }
+  // the 'chrono::steady_clock::time_point' operator<=> is 'partial_ordering', it seems.
+  if (auto cmp = std::weak_order(l.schedule.scheduled_at, r.schedule.scheduled_at);
+      cmp != 0) {
+    return cmp;
+  }
+  if (r.level < l.level) {
+    return std::weak_ordering::less;
+  }
+  if (auto cmp = std::weak_order(l.schedule.not_before, r.schedule.not_before);
+      cmp != 0) {
+    return cmp;
+  }
+  return std::weak_ordering::greater;
+}
+
+static inline std::weak_ordering cmp_future_entries(const Target& l,
+                                                    const Target& r) noexcept
+{
+  if (auto cmp =
+        // std::weak_order(double(l.schedule.not_before), double(r.schedule.not_before));
+      std::weak_order(l.schedule.not_before, r.schedule.not_before);
+      cmp != 0) {
+    return cmp;
+  }
+  // for 'higher is better' sub elements - the 'r.' is on the left
+  if (auto cmp = r.urgency <=> l.urgency; cmp != 0) {
+    return cmp;
+  }
+  if (auto cmp = std::weak_order(l.schedule.scheduled_at, r.schedule.scheduled_at);
+      cmp != 0) {
+    return cmp;
+  }
+  if (r.level < l.level) {
+    return std::weak_ordering::less;
+  }
+  return std::weak_ordering::greater;
+}
+
+static inline std::weak_ordering cmp_entries(chrono::steady_clock::time_point t,
+                                             const Target& l,
+                                             const Target& r) noexcept
+{
+  bool l_ripe = l.schedule.not_before <= t;
+  bool r_ripe = r.schedule.not_before <= t;
+  if (l_ripe) {
+    if (r_ripe) {
+      return cmp_ripe_entries(l, r);
+    }
+    return std::weak_ordering::less;
+  }
+  if (r_ripe) {
+    return std::weak_ordering::greater;
+  }
+  return cmp_future_entries(l, r);
+}
+
+
+
+Target& Job::earliest_target()
+{
+  std::weak_ordering compr = cmp_future_entries(a, b);
+  return (compr == std::weak_ordering::less) ? a : b;
+}
+
+const Target& Job::earliest_target() const
+{
+  std::weak_ordering compr = cmp_future_entries(a, b);
+  return (compr == std::weak_ordering::less) ? a : b;
+}
+
+
+Target& Job::earliest_target(chrono::steady_clock::time_point scrub_clock_now)
+{
+  std::weak_ordering compr = cmp_entries(scrub_clock_now, a, b);
+  return (compr == std::weak_ordering::less) ? a : b;
+}
+
+const Target& Job::earliest_target(chrono::steady_clock::time_point scrub_clock_now) const
+{
+  std::weak_ordering compr = cmp_entries(scrub_clock_now, a, b);
+  return (compr == std::weak_ordering::less) ? a : b;
+}
+
 
 //   const Target& earliest_target(const chrono::steady_clock::time_point& now) const
 //   {
@@ -52,7 +158,9 @@ struct Job {
 //     }
 //     return b;
 //   }
-};
+
+
+
 
 struct scrub_flags_t {
 
@@ -119,7 +227,7 @@ struct PgScrubber {
 
   scrub_flags_t m_scrub_flags;
 
-  bool m_active = true; // must be true for this test
+  bool m_active = true;  // must be true for this test
   std::optional<Target> m_active_target;
 
   string cached_flags;
@@ -162,7 +270,7 @@ ostream& PgScrubber::show_concise(ostream& out) const
     const std::string sep = (flags_txt.empty() ? "" : ",");
     if (m_active_target) {
       return out << fmt::format("({}{}{}{})", (m_scrub_job->blocked ? "*blocked*," : ""),
-                                m_active_target->urgency(), sep, flags_txt);
+                                m_active_target->urgency_txt(), sep, flags_txt);
     } else {
       return out << fmt::format("(in-act{}{}{})",
                                 (m_scrub_job->blocked ? "-*blocked*" : ""), sep,
@@ -178,7 +286,8 @@ ostream& PgScrubber::show_concise(ostream& out) const
     return out;
   }
   return out << fmt::format("[next-scrub:{},{:10.10}]",
-                            (next_scrub.is_deep() ? "dp" : "sh"), next_scrub.urgency());
+                            (next_scrub.is_deep() ? "dp" : "sh"),
+                            next_scrub.urgency_txt());
 }
 
 
@@ -208,7 +317,7 @@ ostream& PgScrubber::show_2(ostream& out) const
     const std::string sep = (flags_txt.empty() ? "" : ",");
     if (m_active_target) {
       return out << fmt::format("({}{}{}{})", (m_scrub_job->blocked ? "*blocked*," : ""),
-                                m_active_target->urgency(), sep, flags_txt);
+                                m_active_target->urgency_txt(), sep, flags_txt);
     } else {
       return out << fmt::format("(in-act{}{}{})",
                                 (m_scrub_job->blocked ? "-*blocked*" : ""), sep,
@@ -224,7 +333,8 @@ ostream& PgScrubber::show_2(ostream& out) const
     return out;
   }
   return out << fmt::format("[next-scrub:{},{:10.10}]",
-                            (next_scrub.is_deep() ? "dp" : "sh"), next_scrub.urgency());
+                            (next_scrub.is_deep() ? "dp" : "sh"),
+                            next_scrub.urgency_txt());
 }
 
 
@@ -422,13 +532,13 @@ int main()
   PgScrubber pg2{false, false, false, false, false};
 
   {
-  ostringstream os;
-        pg1.show_concise(os);
+    ostringstream os;
+    pg1.show_concise(os);
     cout << "pg1: " << os.str() << endl;
   }
   {
-  ostringstream os;
-        pg2.show_concise(os);
+    ostringstream os;
+    pg2.show_concise(os);
     cout << "pg2: " << os.str() << endl;
   }
 }
